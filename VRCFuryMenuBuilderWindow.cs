@@ -16,7 +16,7 @@ namespace VRCFuryMenuBuilder
     public class VRCFuryMenuBuilderWindow : EditorWindow
     {
         private const string WINDOW_TITLE = "VRCFury Menu Builder";
-        private const string TOOL_VERSION = "v1.1";
+        private const string TOOL_VERSION = "v1.2";
         private static readonly string[] TAB_LABELS = { "  Toggles  ", "  Submenus  ", "  Parameters  " };
 
         // ── Persistent state ─────────────────────────────────────────────────────
@@ -54,22 +54,33 @@ namespace VRCFuryMenuBuilder
         {
             _stylesReady = false;
             if (!VRCFuryBridge.IsAvailable) VRCFuryBridge.Initialize();
-            RefreshFromAvatar();
-            TryAutoSelectFromHierarchy();
-        }
 
-        private void OnSelectionChange()
-        {
+            // Refresh datos del avatar ya persistido (si lo hay)
+            // ANTES de intentar auto-seleccionar, para no pisar lo serializado
+            RefreshFromAvatar();
+
+            // Solo auto-selecciona si el campo está vacío
             TryAutoSelectFromHierarchy();
         }
 
         // ── Auto-select ──────────────────────────────────────────────────────────
+        // OnSelectionChange eliminado intencionalmente.
+        // Ya no reaccionamos al click en la jerarquía para no pisar el avatar fijado.
+
+        /// <summary>
+        /// Solo rellena el campo avatar si está vacío.
+        /// Una vez fijado (por serialización o por el usuario) no lo tocamos.
+        /// </summary>
         private void TryAutoSelectFromHierarchy()
         {
+            // GUARD: si ya hay un avatar seleccionado, no hacer nada
+            if (_selectedAvatar != null) return;
+
             if (Selection.activeGameObject == null) return;
             var descriptor = Selection.activeGameObject
                 .GetComponentInParent<VRC.SDK3.Avatars.Components.VRCAvatarDescriptor>(true);
-            if (descriptor == null || descriptor.gameObject == _selectedAvatar) return;
+            if (descriptor == null) return;
+
             _selectedAvatar = descriptor.gameObject;
             RefreshFromAvatar();
             Repaint();
@@ -83,6 +94,7 @@ namespace VRCFuryMenuBuilder
                 _rootIsSetUp  = false;
                 _avatarStatus = new VRCFuryBridge.AvatarStatus();
                 _existingToggles.Clear();
+                _submenus.Clear();
                 _params.Clear();
                 return;
             }
@@ -94,10 +106,15 @@ namespace VRCFuryMenuBuilder
                 ? VRCFuryBridge.GetMenusVRCFury(_selectedAvatar)
                 : null;
 
+            // Limpiar siempre antes de rellenar para no mezclar datos de avatares distintos
+            _existingToggles.Clear();
+
             if (_menusVRCFury != null)
                 _existingToggles = VRCFuryBridge.GetExistingToggles(_menusVRCFury);
-            else
-                _existingToggles.Clear();
+
+            // Si había un toggle en edición y cambiamos de avatar, cancelar el draft
+            if (!_toggleDraft.IsNew)
+                _toggleDraft = new ToggleData { IsNew = true };
 
             RebuildSubmenusFromToggles();
             RebuildParams();
@@ -105,17 +122,33 @@ namespace VRCFuryMenuBuilder
 
         private void RebuildSubmenusFromToggles()
         {
-            var implied = new HashSet<string>(_submenus.Select(s => s.FullPath));
+            // Partimos de cero para que los submenús reflejen exactamente el
+            // avatar actual. Datos de otro avatar se descartan.
+            _submenus.Clear();
+
+            var implied = new HashSet<string>();
             foreach (var t in _existingToggles)
-                if (!string.IsNullOrEmpty(t.MenuPath) && !implied.Contains(t.MenuPath))
+            {
+                if (string.IsNullOrEmpty(t.MenuPath)) continue;
+
+                // Un path tipo "Ropa/Casual" implica "Ropa" y "Ropa/Casual"
+                var parts       = t.MenuPath.Split('/');
+                var accumulated = "";
+                foreach (var part in parts)
                 {
+                    accumulated = string.IsNullOrEmpty(accumulated) ? part : $"{accumulated}/{part}";
+                    if (implied.Contains(accumulated)) continue;
+
+                    implied.Add(accumulated);
                     _submenus.Add(new SubmenuData
                     {
-                        Name       = t.MenuPath.Split('/').Last(),
-                        ParentPath = MenuBuilderUtils.GetParentPath(t.MenuPath)
+                        Name       = part,
+                        ParentPath = MenuBuilderUtils.GetParentPath(accumulated),
+                        IsExpanded = true
                     });
-                    implied.Add(t.MenuPath);
                 }
+            }
+
             _submenus = _submenus.OrderBy(s => s.FullPath).ToList();
         }
 
@@ -547,7 +580,7 @@ namespace VRCFuryMenuBuilder
         private void BeginEditToggle(ToggleData t)
         {
             _toggleDraft           = t.Clone();
-            _toggleDraft.IsNew     = false;   // explicit — not editing a new draft
+            _toggleDraft.IsNew     = false;
             _toggleFormExpanded    = true;
             _scrollPos             = Vector2.zero;
             Repaint();
@@ -561,7 +594,7 @@ namespace VRCFuryMenuBuilder
 
         private void ExecuteCreateToggle()
         {
-            _toggleDraft.IsNew = true;  // safety — ensure CreateToggle path
+            _toggleDraft.IsNew = true;
             bool ok = VRCFuryBridge.CreateToggle(_menusVRCFury, _toggleDraft);
             if (ok) { ShowNotification(new GUIContent($"✓  '{_toggleDraft.Name}' created!")); _toggleDraft = new ToggleData { IsNew = true }; RefreshFromAvatar(); }
             else ShowNotification(new GUIContent("✕  Failed — see Console"));
@@ -583,7 +616,6 @@ namespace VRCFuryMenuBuilder
             var autoParam = $"Toggle_{MenuBuilderUtils.SanitizeName(_toggleDraft.Name)}";
             var paramUsed = string.IsNullOrEmpty(_toggleDraft.ParamName) ? autoParam : _toggleDraft.ParamName;
 
-            // Warn on duplicate only when creating (not editing same toggle)
             bool isDuplicate = _toggleDraft.IsNew && _params.Contains(paramUsed);
             if (isDuplicate) return (true, $"Param '{paramUsed}' already exists — will share it.");
 
